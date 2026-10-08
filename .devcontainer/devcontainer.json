@@ -1,0 +1,10 @@
+{
+    "name": "Arduino AVR",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "runArgs": [
+        "--device=/dev/ttyACM0:/dev/ttyACM0",
+        "--group-add=dialout"
+    ]
+}
