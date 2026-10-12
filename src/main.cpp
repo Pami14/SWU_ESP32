@@ -6,141 +6,109 @@
 #include <util/delay.h>
 #include <stdint.h>
 
+// ---- Pins (Arduino Uno/Nano) ----
+// EN   = D7 = PD7 (active LOW)
+// STEP = D2 = PD2
+// DIR  = D3 = PD3
+// LED  = D13 = PB5 (onboard status LED: ON while spinning, OFF during the pause)
+
 // ---- Config ----
-static constexpr uint32_t BAUD       = 9600;
-static constexpr uint16_t UBRR_VALUE = (F_CPU / (16UL * BAUD)) - 1;  // 103 @ 16 MHz
-static constexpr uint8_t  DRIVER_ADDR = 0;                           // MS1 = MS2 = GND
+// MS1 = MS2 = GND -> 1/8 microstepping
+static constexpr uint16_t MICROSTEPS    = 8;
+static constexpr uint16_t STEPS_PER_REV = 200 * MICROSTEPS;   // 1.8 deg motor -> 1600
 
-// ---- TMC2209 registers ----
-static constexpr uint8_t REG_GCONF = 0x00;
-static constexpr uint8_t REG_IFCNT = 0x02;
-static constexpr uint8_t REG_IOIN  = 0x06;
+static constexpr float    START_RPM     = 10.0f;     // speed at which the ramp starts/ends
+static constexpr float    TARGET_RPM    = 100.0f;
+static constexpr uint32_t RAMP_UP_MS    = 1500;      // acceleration time
+static constexpr uint32_t RAMP_DOWN_MS  = 1000;      // braking time
+static constexpr uint32_t RUN_MS        = 20000;     // time at full speed
+static constexpr uint32_t STOP_MS       = 5000;      // standstill before reversing
 
-static constexpr uint32_t GCONF_PDN_DISABLE = (1UL << 6);  // use PDN_UART as UART
-
-// ---- UART ----
-static void uart_init() {
-  UBRR0H = UBRR_VALUE >> 8;
-  UBRR0L = UBRR_VALUE & 0xFF;
-  UCSR0B = (1 << RXEN0) | (1 << TXEN0);
-  UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);   // 8N1
+// ---- Timer1: free running, 0.5 us per tick (prescaler 8 @ 16 MHz) ----
+static void timer_init() {
+  TCCR1A = 0;
+  TCCR1B = (1 << CS11);
 }
 
-static void uart_tx(uint8_t b) {
-  while (!(UCSR0A & (1 << UDRE0))) {}
-  UDR0 = b;
+// Busy-wait until 'ticks' have passed since 'start' (max 65535 ticks = 32 ms)
+static inline void wait_since(uint16_t start, uint16_t ticks) {
+  while ((uint16_t)(TCNT1 - start) < ticks) {}
 }
 
-// Returns false on timeout (~10 ms)
-static bool uart_rx(uint8_t &b) {
-  for (uint8_t i = 0; i < 100; i++) {
-    if (UCSR0A & (1 << RXC0)) {
-      b = UDR0;
-      return true;
-    }
-    _delay_us(100);
-  }
-  return false;
+// ---- Pin helpers ----
+static void pins_init() {
+  DDRD  |= (1 << DDD7) | (1 << DDD2) | (1 << DDD3);
+  PORTD |= (1 << PORTD7);                              // driver disabled
+  PORTD &= ~((1 << PORTD2) | (1 << PORTD3));
 }
 
-static void uart_flush_rx() {
-  while (UCSR0A & (1 << RXC0)) { (void)UDR0; }
-}
-
-// ---- TMC2209 protocol ----
-static uint8_t crc8(const uint8_t *data, uint8_t len) {
-  uint8_t crc = 0;
-  for (uint8_t i = 0; i < len; i++) {
-    uint8_t cur = data[i];
-    for (uint8_t j = 0; j < 8; j++) {
-      if ((crc >> 7) ^ (cur & 0x01)) crc = (crc << 1) ^ 0x07;
-      else                           crc = (crc << 1);
-      cur >>= 1;
-    }
-  }
-  return crc;
-}
-
-static bool tmc_write(uint8_t reg, uint32_t value) {
-  uint8_t d[8] = {
-    0x05, DRIVER_ADDR, (uint8_t)(reg | 0x80),
-    (uint8_t)(value >> 24), (uint8_t)(value >> 16),
-    (uint8_t)(value >> 8),  (uint8_t)value, 0
-  };
-  d[7] = crc8(d, 7);
-
-  uart_flush_rx();
-  for (uint8_t i = 0; i < 8; i++) uart_tx(d[i]);
-
-  // discard the 8 echoed bytes
-  uint8_t tmp;
-  for (uint8_t i = 0; i < 8; i++) {
-    if (!uart_rx(tmp)) return false;
-  }
-  return true;
-}
-
-static bool tmc_read(uint8_t reg, uint32_t &value) {
-  uint8_t req[4] = { 0x05, DRIVER_ADDR, (uint8_t)(reg & 0x7F), 0 };
-  req[3] = crc8(req, 3);
-
-  uart_flush_rx();
-  for (uint8_t i = 0; i < 4; i++) uart_tx(req[i]);
-
-  // discard the 4 echoed bytes
-  uint8_t tmp;
-  for (uint8_t i = 0; i < 4; i++) {
-    if (!uart_rx(tmp)) return false;
-  }
-
-  // receive the 8-byte reply
-  uint8_t r[8];
-  for (uint8_t i = 0; i < 8; i++) {
-    if (!uart_rx(r[i])) return false;
-  }
-
-  if (r[0] != 0x05 || r[1] != 0xFF || r[2] != (reg & 0x7F)) return false;
-  if (crc8(r, 7) != r[7]) return false;
-
-  value = ((uint32_t)r[3] << 24) | ((uint32_t)r[4] << 16) |
-          ((uint32_t)r[5] << 8)  |  (uint32_t)r[6];
-  return true;
-}
-
-// ---- LED status ----
-static void led_init() { DDRB |= (1 << DDB5); }
+static void led_init() { DDRB |= (1 << DDB5); PORTB &= ~(1 << PORTB5); }
 static void led_on()   { PORTB |=  (1 << PORTB5); }
 static void led_off()  { PORTB &= ~(1 << PORTB5); }
 
-static void led_blink_forever(uint16_t ms) {
-  while (true) {
-    led_on();  for (uint16_t i = 0; i < ms; i++) _delay_ms(1);
-    led_off(); for (uint16_t i = 0; i < ms; i++) _delay_ms(1);
+static void driver_enable()  { PORTD &= ~(1 << PORTD7); }
+static void driver_disable() { PORTD |=  (1 << PORTD7); }
+
+static void set_dir(bool forward) {
+  if (forward) PORTD |=  (1 << PORTD3);
+  else         PORTD &= ~(1 << PORTD3);
+  _delay_us(5);
+}
+
+static void wait_ms(uint32_t ms) {
+  while (ms--) _delay_ms(1);
+}
+
+// Step period in timer ticks (0.5 us) for a given speed
+static uint16_t period_ticks(float rpm) {
+  float steps_per_s = rpm * STEPS_PER_REV / 60.0f;
+  float period_us   = 1000000.0f / steps_per_s;
+  float ticks       = period_us * 2.0f;
+  if (ticks > 65000.0f) ticks = 65000.0f;
+  return (uint16_t)ticks;
+}
+
+// Runs for duration_ms while the speed changes linearly from rpm_start to rpm_end.
+// Use rpm_start == rpm_end for constant speed.
+static void run_segment(float rpm_start, float rpm_end, uint32_t duration_ms) {
+  const uint32_t duration_us = duration_ms * 1000UL;
+  uint32_t elapsed_us = 0;
+
+  while (elapsed_us < duration_us) {
+    float frac = (float)elapsed_us / (float)duration_us;
+    float rpm  = rpm_start + (rpm_end - rpm_start) * frac;
+    uint16_t period = period_ticks(rpm);
+
+    uint16_t t0 = TCNT1;
+    PORTD |= (1 << PORTD2);          // STEP high
+    wait_since(t0, 20);              // 10 us pulse
+    PORTD &= ~(1 << PORTD2);         // STEP low
+    wait_since(t0, period);          // complete the step period
+
+    elapsed_us += period / 2;
   }
 }
 
+static void run_cycle(bool forward) {
+  set_dir(forward);
+  led_on();                                            // spinning -> LED on
+  run_segment(START_RPM,  TARGET_RPM, RAMP_UP_MS);     // ramp up
+  run_segment(TARGET_RPM, TARGET_RPM, RUN_MS);         // 20 s at 100 rpm
+  run_segment(TARGET_RPM, START_RPM,  RAMP_DOWN_MS);   // brake
+  led_off();                                           // standstill -> LED off
+  wait_ms(STOP_MS);                                    // 5 s standstill (motor holds position)
+}
+
 int main() {
+  pins_init();
   led_init();
+  timer_init();
+  wait_ms(500);          // let the TMC2209 power up
+  driver_enable();
 
-  // Driver disabled for now (EN is active LOW)
-  DDRD  |= (1 << DDD7);
-  PORTD |= (1 << PORTD7);
-
-  uart_init();
-  _delay_ms(500);   // let the TMC2209 power up
-
-  uint32_t ioin = 0, ifcnt_before = 0, ifcnt_after = 0;
-
-  // 1) Read IOIN and check chip version (bits 31..24 = 0x21 for TMC2209)
-  if (!tmc_read(REG_IOIN, ioin)) led_blink_forever(80);        // fast blink: no comms
-  if ((ioin >> 24) != 0x21)      led_blink_forever(500);       // slow blink: wrong chip
-
-  // 2) Write test: IFCNT must increase by 1 after a successful write
-  if (!tmc_read(REG_IFCNT, ifcnt_before)) led_blink_forever(80);
-  if (!tmc_write(REG_GCONF, GCONF_PDN_DISABLE)) led_blink_forever(80);
-  if (!tmc_read(REG_IFCNT, ifcnt_after)) led_blink_forever(80);
-  if (((ifcnt_before + 1) & 0xFF) != (ifcnt_after & 0xFF)) led_blink_forever(80);
-
-  led_on();   // solid on: read and write both verified
-  while (true) {}
+  bool forward = true;
+  while (true) {
+    run_cycle(forward);
+    forward = !forward;  // reverse for the next cycle
+  }
 }
